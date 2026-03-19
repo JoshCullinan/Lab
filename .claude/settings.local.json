@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:trakcarelabwebview.nhls.ac.za)",
+      "Bash(pip install:*)",
+      "Bash(playwright install:*)",
+      "Bash(python -c \"import io; import fitz; doc = fitz.open\\(''Test_PDF.pdf''\\); print\\(''Pages:'', len\\(doc\\)\\); text = doc[0].get_text\\(\\); print\\(''Text length:'', len\\(text\\)\\); print\\(''---TEXT---''\\); print\\(text[:3000]\\)\")",
+      "Bash(python -c \":*)",
+      "Bash(python -c \"from core.results import ResultsManager; print\\(''OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''core/results.py''\\).read\\(\\)\\); print\\(''Syntax OK''\\)\")",
+      "Bash(python -c \"from core.results import ResultsManager; print\\(''Import OK''\\)\")",
+      "Bash(python main.py --specimen W25-567890)",
+      "Bash(python main.py --specimen AKBA7503NOF)",
+      "Bash(python -m venv .venv)",
+      "Bash(.venv/Scripts/pip install:*)"
+    ]
+  }
+}
