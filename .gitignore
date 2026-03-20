@@ -22,5 +22,9 @@ build/
 .DS_Store
 Thumbs.db
 
+# Test/debug scripts
+test_*.py
+data/test_episodes/
+
 #Claude
 .claude

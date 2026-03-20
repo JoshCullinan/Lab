@@ -12,7 +12,13 @@
       "Bash(python main.py --specimen W25-567890)",
       "Bash(python main.py --specimen AKBA7503NOF)",
       "Bash(python -m venv .venv)",
-      "Bash(.venv/Scripts/pip install:*)"
+      "Bash(.venv/Scripts/pip install:*)",
+      "Bash(py --version)",
+      "Bash(where python*)",
+      "Bash(py -m venv .venv)",
+      "Bash(.venv/Scripts/playwright install:*)",
+      "Bash(find C:UsersjoshcDesktopLab -type f -name *.txt)",
+      "Bash(ls:*)"
     ]
   }
 }

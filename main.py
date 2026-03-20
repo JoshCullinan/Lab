@@ -3,7 +3,7 @@ LabTrack Viewer — CLI entry point
 
 Usage examples:
     python main.py --scan                # Webcam barcode scan → search → display results
-    python main.py --specimen W25-123    # Direct specimen ID lookup
+    python main.py --specimen AKBA7503NOF    # Direct specimen ID lookup
     python main.py --episode LH00899939  # Look up by episode number
     python main.py --name "SMITH"        # Search by surname (pick from list)
     python main.py --name "SMITH JOHN"   # Search by surname + given name
