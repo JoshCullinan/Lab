@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Only allow HTTPS connections -->
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+
+    <!-- Pin the NHLS TrakCare domain -->
+    <domain-config cleartextTrafficPermitted="false">
+        <domain includeSubdomains="true">trakcarelabwebview.nhls.ac.za</domain>
+    </domain-config>
+</network-security-config>
