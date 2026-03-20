@@ -42,6 +42,27 @@ class PatientResult:
     tests: list[TestResult] = field(default_factory=list)
 
 
+@dataclass
+class EpisodeRow:
+    row_index: int
+    episode_number: str
+    doctor: str
+    collection_datetime: str
+    pdf_selector: str           # "#web_EPVisitNumber_List_1-row-N-item-DocRptPDF-link"
+    clickable: list[dict]       # [{id, text}] — VISTS_ links scoped to this row
+    pending: list[str]
+
+
+@dataclass
+class PatientSearchHit:
+    row_index: int
+    mrn: str
+    surname: str
+    given_name: str
+    dob: str
+    episode: str
+
+
 # ── Manager ───────────────────────────────────────────────────────────────────
 
 class ResultsManager:
@@ -52,18 +73,13 @@ class ResultsManager:
     # ── Public API ────────────────────────────────────────────────────────────
 
     async def search_by_specimen(self, specimen_id: str) -> Optional[PatientResult]:
-        """
-        Search for a patient result by specimen ID.
-        Flow: search → click MRN → episode list → click each test set → aggregate.
-        """
+        """Search for a patient result by specimen ID."""
         await self._auth.ensure_authenticated()
         page = await self._session.get_page()
 
-        # Step 1: Navigate to search page and submit search
         await self._navigate_to_search(page)
         await self._submit_search(page, specimen_id)
 
-        # Step 2: Wait for MRN link to appear (search results loaded)
         try:
             await page.wait_for_selector(
                 config.SEL_MRN_LINK, state="visible", timeout=config.PAGE_TIMEOUT_MS,
@@ -75,13 +91,123 @@ class ResultsManager:
                 return None
             return None
 
-        # Step 3: Click the MRN link to open the episode list
         mrn_link = await page.query_selector(config.SEL_MRN_LINK)
         if not mrn_link:
             return None
         await mrn_link.click()
 
-        # Step 4: Wait for the episode list page to load
+        return await self._process_patient_page(page, specimen_id)
+
+    async def search_by_episode(self, episode_id: str) -> Optional[PatientResult]:
+        """Search for a patient result by episode number."""
+        await self._auth.ensure_authenticated()
+        page = await self._session.get_page()
+
+        await self._navigate_to_search(page)
+        await page.click(config.SEL_SEARCH_CLEAR)
+        await page.wait_for_timeout(500)
+        await page.fill(config.SEL_SEARCH_EPISODE, episode_id)
+        await page.click(config.SEL_SEARCH_BUTTON)
+
+        # TrakCare may show a patient list or navigate directly to the episode
+        try:
+            await page.wait_for_selector(
+                config.SEL_MRN_LINK, state="visible", timeout=config.PAGE_TIMEOUT_MS,
+            )
+            mrn_link = await page.query_selector(config.SEL_MRN_LINK)
+            if mrn_link:
+                await mrn_link.click()
+        except PlaywrightTimeout:
+            # May have navigated directly to episode list — check for banner
+            try:
+                await page.wait_for_selector(
+                    config.SEL_BANNER_SURNAME, timeout=5000,
+                )
+            except PlaywrightTimeout:
+                self._check_for_session_expiry(page)
+                return None
+
+        return await self._process_patient_page(page, episode_id)
+
+    async def search_by_hospital_mrn(self, hospital_mrn: str) -> Optional[PatientResult]:
+        """Search for a patient result by hospital MRN."""
+        await self._auth.ensure_authenticated()
+        page = await self._session.get_page()
+
+        await self._navigate_to_search(page)
+        await page.click(config.SEL_SEARCH_CLEAR)
+        await page.wait_for_timeout(500)
+        await page.fill(config.SEL_SEARCH_HOSPITAL_MRN, hospital_mrn)
+        await page.click(config.SEL_SEARCH_BUTTON)
+
+        try:
+            await page.wait_for_selector(
+                config.SEL_MRN_LINK, state="visible", timeout=config.PAGE_TIMEOUT_MS,
+            )
+        except PlaywrightTimeout:
+            self._check_for_session_expiry(page)
+            return None
+
+        mrn_link = await page.query_selector(config.SEL_MRN_LINK)
+        if not mrn_link:
+            return None
+        await mrn_link.click()
+
+        return await self._process_patient_page(page, hospital_mrn)
+
+    async def search_patients_by_hospital_mrn(self, hospital_mrn: str) -> list[dict]:
+        """Search by hospital MRN → return patient list for selection.
+
+        Returns list of patient hit dicts (like search_by_name).
+        """
+        await self._auth.ensure_authenticated()
+        page = await self._session.get_page()
+
+        await self._navigate_to_search(page)
+        await page.click(config.SEL_SEARCH_CLEAR)
+        await page.wait_for_timeout(500)
+        await page.fill(config.SEL_SEARCH_HOSPITAL_MRN, hospital_mrn)
+        await page.click(config.SEL_SEARCH_BUTTON)
+
+        # Wait for first patient row MRN link to appear
+        try:
+            await page.wait_for_selector(
+                config.SEL_MRN_LINK, state="visible", timeout=config.PAGE_TIMEOUT_MS,
+            )
+        except PlaywrightTimeout:
+            self._check_for_session_expiry(page)
+            return []
+
+        return await page.evaluate('''
+            () => {
+                const rows = document.querySelectorAll('tr[id^="web_DEBDebtor_FindList_0-row-"]');
+                return Array.from(rows).map((row, i) => {
+                    function cellText(suffix) {
+                        const el = row.querySelector('[id$="' + suffix + '"]');
+                        return el ? el.innerText.trim() : '';
+                    }
+                    return {
+                        row_index: i,
+                        mrn: cellText('-item-MRN-link') || cellText('-item-MRN'),
+                        surname: cellText('-item-Surname'),
+                        given_name: cellText('-item-GivenName'),
+                        dob: cellText('-item-DOB'),
+                        episode: cellText('-item-Episode'),
+                    };
+                });
+            }
+        ''')
+
+    async def list_episodes_for_patient(self, patient_row_index: int) -> Optional[dict]:
+        """Click a patient row from search results, wait for episode list, return scraped data."""
+        page = await self._session.get_page()
+        mrn_selector = f'#web_DEBDebtor_FindList_0-row-{patient_row_index}-item-MRN-link'
+
+        mrn_link = await page.query_selector(mrn_selector)
+        if not mrn_link:
+            return None
+        await mrn_link.click()
+
         try:
             await page.wait_for_selector(
                 config.SEL_BANNER_SURNAME, timeout=config.PAGE_TIMEOUT_MS,
@@ -90,22 +216,133 @@ class ResultsManager:
             self._check_for_session_expiry(page)
             return None
 
-        # Step 5: Gather episode page data (patient info, test set names, pending status)
+        return await self._scrape_episode_list(page)
+
+    async def load_episode_results(self, row_index: int, episode_data: dict) -> Optional[PatientResult]:
+        """Given a scraped episode list and a selected row index, load that episode's results.
+
+        Directly clicks the PDF link for the target row on the current page (which
+        opens a popup), keeping us on the episode list so subsequent calls work.
+        Never navigates away — safe to call repeatedly for multiple rows.
+        """
+        rows = episode_data.get("rows", [])
+        target = None
+        for r in rows:
+            if r["row_index"] == row_index:
+                target = r
+                break
+        if not target:
+            return None
+
+        episode_num = target.get("episode_number", "")
+        page = await self._session.get_page()
+
+        # Small settle delay between PDF fetches
+        await page.wait_for_timeout(500)
+
+        pdf_link = await page.query_selector(target["pdf_selector"])
+        if not pdf_link:
+            return None
+
+        pdf_bytes = await self._fetch_pdf_bytes(page, pdf_link)
+        if not pdf_bytes:
+            return None
+
+        tests = self._parse_pdf(pdf_bytes, target["collection_datetime"])
+        if not tests:
+            return None
+
+        return PatientResult(
+            patient_name=episode_data["patient_name"],
+            patient_id=episode_data["patient_id"],
+            specimen_id=episode_num or f"row-{row_index}",
+            episode=episode_num,
+            requesting_doctor=target.get("doctor", ""),
+            dob=episode_data["dob"],
+            status="", collection_datetime=target["collection_datetime"],
+            result_datetime="", tests=tests,
+        )
+
+    async def search_by_name(self, surname: str, given_name: str = "") -> list[dict]:
+        """Search by surname (and optional given name). Returns list of patient hit dicts."""
+        await self._auth.ensure_authenticated()
+        page = await self._session.get_page()
+
+        await self._navigate_to_search(page)
+        await page.click(config.SEL_SEARCH_CLEAR)
+        await page.wait_for_timeout(500)
+        await page.fill(config.SEL_SEARCH_SURNAME, surname)
+        if given_name:
+            await page.fill(config.SEL_SEARCH_NAME, given_name)
+        await page.click(config.SEL_SEARCH_BUTTON)
+
+        try:
+            await page.wait_for_selector(
+                config.SEL_SEARCH_RESULTS_TABLE, timeout=config.PAGE_TIMEOUT_MS,
+            )
+        except PlaywrightTimeout:
+            self._check_for_session_expiry(page)
+            return []
+
+        hits = await page.evaluate('''
+            () => {
+                const rows = document.querySelectorAll('tr[id^="web_DEBDebtor_FindList_0-row-"]');
+                return Array.from(rows).map((row, i) => {
+                    function cellText(suffix) {
+                        const el = row.querySelector('[id$="' + suffix + '"]');
+                        return el ? el.innerText.trim() : '';
+                    }
+                    return {
+                        row_index: i,
+                        mrn: cellText('-item-MRN-link') || cellText('-item-MRN'),
+                        surname: cellText('-item-Surname'),
+                        given_name: cellText('-item-GivenName'),
+                        dob: cellText('-item-DOB'),
+                        episode: cellText('-item-Episode'),
+                    };
+                });
+            }
+        ''')
+        return hits
+
+    async def open_patient_by_hit(self, hit: dict, search_term: str) -> Optional[PatientResult]:
+        """Click a specific patient row from search results and load their data."""
+        page = await self._session.get_page()
+        row_index = hit["row_index"]
+        mrn_selector = f'#web_DEBDebtor_FindList_0-row-{row_index}-item-MRN-link'
+
+        mrn_link = await page.query_selector(mrn_selector)
+        if not mrn_link:
+            return None
+        await mrn_link.click()
+
+        return await self._process_patient_page(page, search_term)
+
+    # ── Shared patient page processor ─────────────────────────────────────────
+
+    async def _process_patient_page(self, page: Page, search_id: str) -> Optional[PatientResult]:
+        """Wait for episode list banner, scrape all episodes, fetch all PDFs, fall back to DOM."""
+        try:
+            await page.wait_for_selector(
+                config.SEL_BANNER_SURNAME, timeout=config.PAGE_TIMEOUT_MS,
+            )
+        except PlaywrightTimeout:
+            self._check_for_session_expiry(page)
+            return None
+
         episode_data = await self._scrape_episode_list(page)
 
-        # Step 6: Try PDF approach (fast — one download gets all results)
-        result = await self._try_pdf_approach(page, specimen_id, episode_data)
+        result = await self._try_pdf_approach_all_rows(page, search_id, episode_data)
         if result:
             return result
 
-        # Step 7: Fall back to clicking each test set link
-        return await self._click_test_sets(page, specimen_id, episode_data)
+        return await self._click_test_sets(page, search_id, episode_data)
 
     # ── Episode list scraping ────────────────────────────────────────────────
 
     async def _scrape_episode_list(self, page: Page) -> dict:
-        """Scrape the episode list page for patient info and test set status."""
-        return await page.evaluate('''
+        """Scrape all episode rows for patient info and test set status."""
+        return await page.evaluate(r'''
             () => {
                 function text(id) {
                     const el = document.getElementById(id);
@@ -118,16 +355,40 @@ class ResultsManager:
                 const episode   = text('web_EPVisitNumber_List_Banner-row-0-item-Episode');
                 const dob       = text('web_EPVisitNumber_List_Banner-row-0-item-DOB');
 
-                const doctor         = text('web_EPVisitNumber_List_1-row-0-item-Doctor');
-                const collectionDate = text('web_EPVisitNumber_List_1-row-0-item-CollectionDate');
-                const collectionTime = text('web_EPVisitNumber_List_1-row-0-item-CollectionTime');
-
-                // Clickable test set links
-                const vistsLinks = Array.from(document.querySelectorAll('a[id^="VISTS_"]'))
+                // Global VISTS_ links — flat list for backward-compat fallback
+                const allVistsLinks = Array.from(document.querySelectorAll('a[id^="VISTS_"]'))
                     .map(a => ({id: a.id, text: a.innerText.trim()}));
-                const clickableNames = new Set(vistsLinks.map(l => l.text));
+                const clickableNames = new Set(allVistsLinks.map(l => l.text));
 
-                // Find pending tests: text nodes in the TSList cell that aren't links
+                // Per-row iteration over all episode rows
+                const episodeTrs = document.querySelectorAll('tr[id^="web_EPVisitNumber_List_1-row-"]');
+                const rows = Array.from(episodeTrs).map((tr, i) => {
+                    const rowId = tr.id;
+                    const idMatch = rowId.match(/-row-(\d+)$/);
+                    const rowIndex = idMatch ? parseInt(idMatch[1]) : i;
+
+                    const doctor         = text(rowId + '-item-Doctor');
+                    const collectionDate = text(rowId + '-item-CollectionDate');
+                    const collectionTime = text(rowId + '-item-CollectionTime');
+                    const episodeNum     = text(rowId + '-item-Episode') || '';
+                    const pdfSelector    = '#' + rowId + '-item-DocRptPDF-link';
+
+                    // VISTS_ links scoped to this row
+                    const rowVistsLinks = Array.from(tr.querySelectorAll('a[id^="VISTS_"]'))
+                        .map(a => ({id: a.id, text: a.innerText.trim()}));
+
+                    return {
+                        row_index: rowIndex,
+                        episode_number: episodeNum,
+                        doctor: doctor,
+                        collection_datetime: collectionDate + ' ' + collectionTime,
+                        pdf_selector: pdfSelector,
+                        clickable: rowVistsLinks,
+                        pending: [],
+                    };
+                });
+
+                // Global pending tests: text nodes in TSList cell that aren't links
                 const tsListLabel = document.querySelector('[id$="-item-TSList-label"]');
                 let pending = [];
                 if (tsListLabel) {
@@ -146,125 +407,138 @@ class ResultsManager:
                     }
                 }
 
+                // Backward-compat flat fields (use first row values)
+                const firstRow = rows[0] || {};
+
                 return {
                     patient_name: surname + ', ' + givenName,
                     patient_id: mrn,
                     episode: episode,
                     dob: dob,
-                    doctor: doctor,
-                    collection_datetime: collectionDate + ' ' + collectionTime,
-                    clickable: vistsLinks,
+                    doctor: firstRow.doctor || '',
+                    collection_datetime: firstRow.collection_datetime || '',
+                    clickable: allVistsLinks,
                     pending: pending,
+                    rows: rows,
                 };
             }
         ''')
 
-    # ── PDF approach ─────────────────────────────────────────────────────────
+    # ── PDF helpers ──────────────────────────────────────────────────────────
 
-    async def _try_pdf_approach(self, page: Page, specimen_id: str, episode_data: dict) -> Optional[PatientResult]:
-        """Download and parse the PDF report from the episode list page."""
+    async def _fetch_pdf_bytes(self, page: Page, pdf_link) -> Optional[bytes]:
+        """Open the PDF popup, download the bytes, close the popup."""
         try:
-            pdf_link = await page.query_selector(
-                '#web_EPVisitNumber_List_1-row-0-item-DocRptPDF-link'
-            )
-            if not pdf_link:
-                return None
-
-            async with page.context.expect_page(timeout=15000) as new_page_info:
+            async with page.context.expect_page(timeout=20000) as new_page_info:
                 await pdf_link.click()
 
             new_page = await new_page_info.value
-            await new_page.wait_for_load_state("domcontentloaded", timeout=30000)
+            # networkidle required — PDF frame URL is empty until JS loads it
+            await new_page.wait_for_load_state("networkidle", timeout=30000)
 
-            # The PDF is in an iframe/frame inside the wrapper page
             pdf_bytes = None
             for frame in new_page.frames:
-                if frame.url != new_page.url:
-                    try:
-                        response = await new_page.context.request.get(frame.url)
-                        body = await response.body()
-                        if body[:5] == b'%PDF-':
-                            pdf_bytes = body
-                            break
-                    except Exception:
-                        pass
+                url = frame.url
+                # Skip non-http frames (empty, about:blank, chrome-extension:)
+                if not url or not url.startswith('http') or url == new_page.url:
+                    continue
+                try:
+                    response = await new_page.context.request.get(url)
+                    body = await response.body()
+                    if body[:5] == b'%PDF-':
+                        pdf_bytes = body
+                        break
+                except Exception:
+                    pass
 
             await new_page.close()
+            return pdf_bytes
 
+        except Exception as e:
+            _dbg(f"DEBUG: _fetch_pdf_bytes error: {e}")
+            return None
+
+    async def _try_pdf_approach_all_rows(
+        self, page: Page, search_id: str, scrape_data: dict
+    ) -> Optional[PatientResult]:
+        """Try to download and parse the PDF for every episode row, aggregate all tests."""
+        rows = scrape_data.get("rows", [])
+        if not rows:
+            return None
+
+        all_tests: list[TestResult] = []
+
+        for row in rows:
+            pdf_link = await page.query_selector(row["pdf_selector"])
+            if not pdf_link:
+                continue
+
+            pdf_bytes = await self._fetch_pdf_bytes(page, pdf_link)
             if not pdf_bytes:
-                return None
+                continue
 
-            return self._parse_pdf(pdf_bytes, specimen_id, episode_data)
+            row_tests = self._parse_pdf(pdf_bytes, row["collection_datetime"])
+            all_tests.extend(row_tests)
 
-        except Exception as e:
-            _dbg(f"DEBUG: PDF approach error: {e}")
+        if not all_tests:
             return None
 
-    def _parse_pdf(self, pdf_bytes: bytes, specimen_id: str, episode_data: dict) -> Optional[PatientResult]:
-        """Parse a TrakCare lab result PDF using text extraction or OCR."""
-        tests = []
-        collection_dt = episode_data.get("collection_datetime", "")
-
-        # ── Step 1: Try text extraction first (fast path for text-based PDFs) ──
-        try:
-            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                for pg in pdf.pages:
-                    text = pg.extract_text() or ""
-                    if text.strip():
-                        tests = self._parse_pdf_text(text, collection_dt)
-                        if tests:
-                            break
-        except Exception as e:
-            _dbg(f"DEBUG: pdfplumber text extraction error: {e}")
-
-        # ── Step 2: Fall back to OCR for scanned/image-based PDFs ──
-        if not tests:
-            tests = self._parse_pdf_ocr(pdf_bytes, collection_dt)
-
-        if not tests:
-            return None
-
-        # Add pending tests
-        for name in episode_data.get("pending", []):
-            tests.append(TestResult(
+        # Append global pending tests
+        for name in scrape_data.get("pending", []):
+            all_tests.append(TestResult(
                 test_name=name, value="Pending", unit="", reference_range="",
                 flag="PENDING", collection_datetime="",
             ))
 
+        first_row = rows[0]
         return PatientResult(
-            patient_name=episode_data["patient_name"],
-            patient_id=episode_data["patient_id"],
-            specimen_id=specimen_id,
-            episode=episode_data["episode"],
-            requesting_doctor=episode_data.get("doctor", ""),
-            dob=episode_data["dob"],
+            patient_name=scrape_data["patient_name"],
+            patient_id=scrape_data["patient_id"],
+            specimen_id=search_id,
+            episode=scrape_data.get("episode", ""),
+            requesting_doctor=first_row.get("doctor", ""),
+            dob=scrape_data["dob"],
             status="",
-            collection_datetime=collection_dt,
+            collection_datetime=first_row.get("collection_datetime", ""),
             result_datetime="",
-            tests=tests,
+            tests=all_tests,
         )
 
-    # ── PDF text parser ──────────────────────────────────────────────────────
-    # TrakCare PDFs (via pdfplumber) lay out each result on a single line:
-    #   Name  Value  Unit  RefRange
-    # e.g. "Sodium 136 mmol/L 136 - 145"
-    # e.g. "Bicarbonate 16 L mmol/L 23 - 29"   (flag embedded in value)
-    # e.g. "Haemoglobin index 2+"              (no unit or range — index)
-    # e.g. "Lipaemia index Not detected"       (no unit or range)
-    # e.g. "Vitamin B12 >1476 pmol/L"          (no ref range — only upper limit known)
-    # e.g. "Total cholesterol 1.34 mmol/L"     (no ref range — lipid fraction)
+    def _parse_pdf(self, pdf_bytes: bytes, collection_dt: str) -> list[TestResult]:
+        """Parse a TrakCare lab result PDF. Returns [] on failure."""
+        tests: list[TestResult] = []
 
-    # Unit charset: ASCII letters + µ (U+00B5) + common symbols
-    _UNIT_FIRST = r'[a-zA-Z\xb5/%]'
-    _UNIT_REST  = r'[/a-zA-Z\xb5\xb2%0-9.*^]'
+        # Fast path: pdfplumber text extraction — concatenate ALL pages
+        try:
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                all_text = []
+                for pg in pdf.pages:
+                    text = pg.extract_text() or ""
+                    if text.strip():
+                        all_text.append(text)
+                if all_text:
+                    tests = self._parse_pdf_text("\n".join(all_text), collection_dt)
+        except Exception as e:
+            _dbg(f"DEBUG: pdfplumber text extraction error: {e}")
+
+        # Fallback: OCR for scanned/image-based PDFs
+        if not tests:
+            tests = self._parse_pdf_ocr(pdf_bytes, collection_dt)
+
+        return tests
+
+    # ── PDF text parser ──────────────────────────────────────────────────────
+
+    # Unit pattern: allows parentheses for units like Log(copies/mL), x10^9/L
+    _UNIT_PAT = r'[a-zA-Z\xb5/%][/a-zA-Z\xb5\xb2%0-9.*^()]*'
 
     # 4-field: Name Value Unit RefRange  (ref range is "x - y")
     _PDF_LINE_RE = re.compile(
-        r'^(?P<name>.+?)\s+(?P<value>[><]?\d+[\d.]*\s*[HL]?)\s+(?P<unit>[a-zA-Z\xb5/%]+[/a-zA-Z\xb5\xb2%0-9.*^]*)\s+(?P<range>\d+[\d.]*\s*-\s*\d+[\d.]*\s*)?$'
+        r'^(?P<name>.+?)\s+(?P<value>[><]?\d+[\d.]*\s*[HL]?)\s+(?P<unit>' + _UNIT_PAT + r')\s+(?P<range>\d+[\d.]*\s*-\s*\d+[\d.]*\s*)?$'
     )
     # 4-field with single-sided ref range: Name Value Unit <x or >x
     _PDF_LINE_RE_SINGLESIDED = re.compile(
-        r'^(?P<name>.+?)\s+(?P<value>[><]?\d+[\d.]*\s*[HL]?)\s+(?P<unit>[a-zA-Z\xb5/%]+[/a-zA-Z\xb5\xb2%0-9.*^]*)\s+(?P<range>[<>]\d+[\d.]*\s*)?$'
+        r'^(?P<name>.+?)\s+(?P<value>[><]?\d+[\d.]*\s*[HL]?)\s+(?P<unit>' + _UNIT_PAT + r')\s+(?P<range>[<>]\d+[\d.]*\s*)?$'
     )
     # 2-field: Name Value (indices like "2+" or "Not detected")
     _PDF_LINE_RE2 = re.compile(
@@ -272,39 +546,63 @@ class ResultsManager:
     )
     # 3-field: Name Value Unit (no ref range — lipid fractions, TSH, B12, etc.)
     _PDF_LINE_RE3 = re.compile(
-        r'^(?P<name>.+?)\s+(?P<value>[><]?\d+[\d.]*\s*[HL]?)\s+(?P<unit>[a-zA-Z\xb5/%]+[/a-zA-Z\xb5\xb2%0-9.*^]*)\s*$'
+        r'^(?P<name>.+?)\s+(?P<value>[><]?\d+[\d.]*\s*[HL]?)\s+(?P<unit>' + _UNIT_PAT + r')\s*$'
     )
     # 3-field with compound unit containing a space (e.g. "eGFR (MDRD) 51 mL/min/1.73 m²")
     _PDF_LINE_RE_COMPOUND = re.compile(
         r'^(?P<name>.+?)\s+(?P<value>[><]?\d+[\d.]*\s*[HL]?)\s+(?P<unit>mL/min/[\d.]+\s*\S*)\s*$'
     )
+    # 2-field: Name bare-numeric-value (no unit, e.g. "Fluid pH 8.00")
+    _PDF_LINE_RE_BARE = re.compile(
+        r'^(?P<name>.+?)\s+(?P<value>[><]?\d+[\d.]+)\s*$'
+    )
+
+    # ── Section header sets ──────────────────────────────────────────────────
 
     _SECTION_HEADERS = frozenset([
+        # Chemistry
         'blood chemistry', 'liver function tests', 'lipids', 'inflammatory markers',
         'haematinics', 'thyroid function tests', 'indices', 'indices in serum',
         'creatinine and estimated gfr',
+        # Fluid chemistry
+        'fluid chemistry',
+        # Haematology / immunology
+        'cdarv', 'full blood count',
+        # Virology
+        'hiv molecular investigations', 'hiv viral load',
     ])
 
-    # All-caps headers that introduce advisory/commentary blocks (not results)
+    # Micro/culture sections — captured as free-text blocks
+    _MICRO_SECTION_HEADERS = frozenset([
+        'gram stain', 'bacterial culture', 'tb-naat',
+    ])
+
     _ADVISORY_HEADERS = frozenset([
-        'cardiovascular risk',
-        'disclaimer',
+        'cardiovascular risk', 'disclaimer',
+        'evaluation of effusion results',
+        'cd4 arv comment', 'comment',
+        'lower respiratory tract infection',
+        'systemic bacterial infection',
+        'systemic bacterial infection / sepsis',
     ])
 
     @staticmethod
     def _is_section_header(line: str, section_headers: frozenset) -> bool:
-        """Check if line is a results section header (with optional <Continued> tag)."""
+        # Strip trailing :<tag> (e.g. "Blood chemistry:<Continued>") and colons
         cleaned = re.sub(r':<.*?>$', '', line).strip().rstrip(':')
+        # Also handle "TB-NAAT: GeneXpert MTB/Rif Ultra" — take text before first colon
+        if ':' in cleaned:
+            prefix = cleaned.split(':')[0].strip()
+            if prefix.lower() in section_headers:
+                return True
         return cleaned.lower() in section_headers
 
     @staticmethod
     def _is_advisory_header(line: str, advisory_headers: frozenset) -> bool:
-        """Check if line starts a non-results advisory/commentary block."""
-        upper = line.upper().strip(':').strip()
-        if upper.lower() in advisory_headers:
+        stripped = line.strip().rstrip(':')
+        if stripped.lower() in advisory_headers:
             return True
-        # All-caps text-only lines with 2+ words are advisory (no digits — avoids matching
-        # result lines like "ALT 476 H U/L 7 - 35" which are also trivially all-uppercase)
+        # All-caps text-only lines with 2+ words (department headers like CHEMICAL PATHOLOGY)
         if (line == line.upper() and len(line.split()) >= 2
                 and line[0].isalpha() and not any(c.isdigit() for c in line)):
             return True
@@ -312,22 +610,44 @@ class ResultsManager:
 
     @staticmethod
     def _extract_flag(value_str: str) -> tuple[Optional[str], str]:
-        """Extract trailing H/L flag from a value string. Returns (flag, cleaned_value)."""
         m = re.search(r'\s([HL])\s*$', value_str)
         if m:
             return m.group(1), value_str[:m.start()].rstrip()
         return None, value_str
 
-    def _parse_pdf_text(self, text: str, collection_dt: str) -> list[TestResult]:
-        """Parse pdfplumber-extracted text — single-line format.
+    @staticmethod
+    def _preprocess_pdf_text(text: str) -> str:
+        """Fix superscript artifacts from pdfplumber extraction."""
+        # Fix superscript 9 in units like "x 10 /L" → "x10^9/L"
+        # pdfplumber extracts the superscript 9 as a standalone line
+        text = re.sub(r' x 10 /L', ' x10^9/L', text)
+        # Fix superscript 2 in "mL/min/1.73 m" → "mL/min/1.73m²"
+        text = re.sub(r'mL/min/([\d.]+)\s+m\b', r'mL/min/\1m²', text)
+        return text
 
-        Uses section-based state tracking: only parses result lines when
-        inside a recognised results section (e.g. 'Blood chemistry:'),
-        and stops parsing when advisory/commentary blocks are detected
-        (e.g. 'CARDIOVASCULAR RISK').
-        """
-        tests = []
+    def _parse_pdf_text(self, text: str, collection_dt: str) -> list[TestResult]:
+        """Parse pdfplumber-extracted text — section-based state machine."""
+        text = self._preprocess_pdf_text(text)
+
+        tests: list[TestResult] = []
         in_results_section = False
+        in_micro_section = False
+        micro_lines: list[str] = []
+        micro_name = ""
+
+        def _flush_micro():
+            nonlocal micro_lines, micro_name, in_micro_section
+            if micro_lines:
+                tests.append(TestResult(
+                    test_name=micro_name,
+                    value="\n".join(micro_lines),
+                    unit="", reference_range="", flag=None,
+                    collection_datetime=collection_dt,
+                ))
+            micro_lines = []
+            micro_name = ""
+            in_micro_section = False
+
         for raw in text.split('\n'):
             line = raw.strip()
             if not line:
@@ -337,18 +657,40 @@ class ResultsManager:
                 continue
 
             # ── Section transitions ──
+
             if self._is_section_header(line, self._SECTION_HEADERS):
+                _flush_micro()
                 in_results_section = True
                 continue
 
-            if self._is_advisory_header(line, self._ADVISORY_HEADERS):
+            if self._is_section_header(line, self._MICRO_SECTION_HEADERS):
+                _flush_micro()
+                in_micro_section = True
+                # Use the header text (before colon) as the section name
+                micro_name = re.sub(r':<.*?>$', '', line).strip().rstrip(':')
+                if ':' in micro_name:
+                    # "TB-NAAT: GeneXpert MTB/Rif Ultra" → keep full text
+                    pass
                 in_results_section = False
+                continue
+
+            if self._is_advisory_header(line, self._ADVISORY_HEADERS):
+                _flush_micro()
+                in_results_section = False
+                continue
+
+            # ── Micro section: accumulate free text ──
+
+            if in_micro_section:
+                micro_lines.append(line)
                 continue
 
             if not in_results_section:
                 continue
 
-            # Try 4-field pattern: Name Value Unit RefRange (double-sided like "136 - 145")
+            # ── Standard result line matching ──
+
+            # 4-field: Name Value Unit RefRange
             m = self._PDF_LINE_RE.match(line)
             if m:
                 flag, value_str = self._extract_flag(m.group('value').strip())
@@ -362,7 +704,7 @@ class ResultsManager:
                 ))
                 continue
 
-            # Try 4-field with single-sided ref range: Value Unit <x or >x
+            # 4-field single-sided ref range
             m_ss = self._PDF_LINE_RE_SINGLESIDED.match(line)
             if m_ss:
                 flag, value_str = self._extract_flag(m_ss.group('value').strip())
@@ -376,38 +718,33 @@ class ResultsManager:
                 ))
                 continue
 
-            # Try 2-field pattern: Name Value (indices like "2+" or "Not detected")
+            # 2-field: Name + "Not detected" or "2+"
             m2 = self._PDF_LINE_RE2.match(line)
             if m2:
                 tests.append(TestResult(
                     test_name=m2.group('name').strip(),
                     value=m2.group('value').strip(),
-                    unit='',
-                    reference_range='',
-                    flag=None,
+                    unit='', reference_range='', flag=None,
                     collection_datetime=collection_dt,
                 ))
                 continue
 
-            # Try 3-field pattern: Name Value Unit (no ref range — lipid fractions, TSH, B12, etc.)
+            # 3-field: Name Value Unit
             m3 = self._PDF_LINE_RE3.match(line)
             if m3:
                 name = m3.group('name').strip()
-                # Skip lines where the name looks like a range fragment
-                # (e.g. "HDL Cholesterol 1.0 -" — pdfplumber split a favourable-value note)
                 if not re.search(r'\d\s-\s*$', name):
                     flag, value_str = self._extract_flag(m3.group('value').strip())
                     tests.append(TestResult(
                         test_name=name,
                         value=value_str,
                         unit=m3.group('unit').strip(),
-                        reference_range='',
-                        flag=flag,
+                        reference_range='', flag=flag,
                         collection_datetime=collection_dt,
                     ))
                 continue
 
-            # Try compound-unit 3-field: Name Value two-token-unit (e.g. "eGFR (MDRD) 51 mL/min/1.73 m²")
+            # Compound unit (eGFR)
             mc = self._PDF_LINE_RE_COMPOUND.match(line)
             if mc:
                 flag, value_str = self._extract_flag(mc.group('value').strip())
@@ -415,14 +752,24 @@ class ResultsManager:
                     test_name=mc.group('name').strip(),
                     value=value_str,
                     unit=mc.group('unit').strip(),
-                    reference_range='',
-                    flag=flag,
+                    reference_range='', flag=flag,
                     collection_datetime=collection_dt,
                 ))
                 continue
 
-            # Unrecognised line inside section — skip it; advisory headers already
-            # handle section exits via _is_advisory_header above.
+            # Bare numeric: Name Value (no unit, e.g. "Fluid pH 8.00")
+            mb = self._PDF_LINE_RE_BARE.match(line)
+            if mb:
+                tests.append(TestResult(
+                    test_name=mb.group('name').strip(),
+                    value=mb.group('value').strip(),
+                    unit='', reference_range='', flag=None,
+                    collection_datetime=collection_dt,
+                ))
+                continue
+
+        # Flush any trailing micro section
+        _flush_micro()
 
         return tests
 
@@ -430,22 +777,32 @@ class ResultsManager:
         """Return True for page banners, headers, footer, and non-result lines."""
         upper = raw.upper()
 
-        # Page banners
-        if 'PRACTICE NUMBER' in upper or 'LAB NUMBER:' in upper or 'COLLECTED:' in upper:
-            if 'REPORT TO:' in upper or 'PATIENT:' in upper:
-                return True
-        if 'BHEKI MLANGENI LABORATORY' in upper:
+        # Page banners (first page and continuation pages)
+        if 'LAB NUMBER:' in upper:
+            return True
+        if 'PRACTICE NUMBER' in upper:
+            return True
+        if 'PATIENT:' in upper and 'REPORT TO:' in upper:
+            return True
+        if 'BHEKI MLANGENI' in upper or 'ZOLA JABULANI' in upper:
             return True
         if re.match(r'pg\s+\d+\s+of\s+\d+', raw, re.IGNORECASE):
             return True
         if re.match(r'LH\s+\w+', raw):
+            return True
+        # Continuation page location lines: "Hospital, Ward, Hospital Number XXXXX"
+        if 'HOSPITAL NUMBER' in upper and ',' in raw:
+            return True
+        if 'PRINTED:' in upper or 'COLLECTED:' in upper or 'RECEIVED:' in upper:
+            return True
+        if '1ST PRINT:' in upper or 'REPRINT:' in upper:
             return True
 
         # Footer
         if 'AUTHORIZED BY:' in upper or 'AUTHORISED BY:' in upper or '-- END OF LABORATORY REPORT --' in upper:
             return True
 
-        # Non-result inlined lines
+        # Non-result metadata lines
         if re.match(r'\d{2}/\d{2}/\d{2}\s+\(\d+y\)\s+Sex\s+[MF]', raw):
             return True
         if re.match(r'Sample Ref:', raw) or re.match(r'Hospital Number:', raw):
@@ -456,6 +813,18 @@ class ResultsManager:
             return True
         if re.match(r'^[MF]\s+\d+y\)', raw):
             return True
+        # "@" referral lines (e.g. "@ Test referred to another NHLS laboratory")
+        if raw.startswith('@') or raw.startswith('@ '):
+            return True
+        # "Specimen received:" / "Tests requested:" lines
+        if re.match(r'(Specimen received|Tests requested):', raw):
+            return True
+        # "Patient Location:" lines
+        if raw.startswith('Patient Location:'):
+            return True
+        # "FOR ENQUIRIES" boilerplate
+        if 'FOR ENQUIRIES' in upper:
+            return True
 
         # Lipid target table rows
         if re.match(r'<\d+(\.\d+)?\s*mmol/L\s*$', raw):
@@ -464,8 +833,24 @@ class ResultsManager:
             return True
         if re.match(r'(TC target|LDLC target|non-HDLC target|Risk Category)', raw, re.IGNORECASE):
             return True
+        if re.match(r'(Fasting triglycerides|When TG|While higher|Additionally)', raw):
+            return True
 
-        # Purely numeric standalone lines (page numbers, isolated ranges)
+        # Reference/citation lines
+        if re.match(r'(https?://|References:)', raw):
+            return True
+        if re.match(r'[A-Z][a-z]+ [A-Z]+,?\s+et al\.', raw):
+            return True
+        # Journal citations (e.g. "Clin Chim Acta", "Eur Heart J")
+        if re.search(r'Clin Chim|Eur Heart|S Afr Med|doi\.org', raw):
+            return True
+        # Commentary boilerplate that matches bare-numeric pattern
+        if raw.startswith('Based on the sample') or raw.startswith('The result should'):
+            return True
+        if 'effusions' in raw.lower() and 'Acta' in raw:
+            return True
+
+        # Purely numeric standalone lines (page numbers, superscript digits)
         if re.match(r'^\d[\d\s.-]*$', raw):
             return True
 
@@ -510,7 +895,6 @@ class ResultsManager:
         """Click each test set link and aggregate all results."""
         clickable = episode_data.get("clickable", [])
         if not clickable:
-            # No clickable tests — return patient info with only pending
             pending = episode_data.get("pending", [])
             if not pending:
                 return None
@@ -531,7 +915,6 @@ class ResultsManager:
                 ],
             )
 
-        # Click first link to get patient info + first batch of results
         first_link = await page.query_selector(f'#{clickable[0]["id"]}')
         if not first_link:
             return None
@@ -547,7 +930,6 @@ class ResultsManager:
         if not result:
             return None
 
-        # Click remaining links: back → wait for link → click → parse
         for ts in clickable[1:]:
             await page.go_back(wait_until="domcontentloaded")
             try:
@@ -565,7 +947,6 @@ class ResultsManager:
             extra = await self._parse_test_rows(page)
             result.tests.extend(extra)
 
-        # Append pending tests at the end
         for name in episode_data.get("pending", []):
             result.tests.append(TestResult(
                 test_name=name, value="Pending", unit="", reference_range="",
@@ -578,8 +959,6 @@ class ResultsManager:
 
     async def _navigate_to_search(self, page: Page) -> None:
         """Navigate to the Patient Find search page."""
-        if config.SEARCH_HASH in page.url:
-            return
         search_url = config.BASE_URL + config.SEARCH_HASH
         await page.goto(search_url, wait_until="domcontentloaded", timeout=config.PAGE_TIMEOUT_MS)
         self._check_for_session_expiry(page)
@@ -634,7 +1013,6 @@ class ResultsManager:
             const testName = text(rowId + '-item-TestItem');
             const value    = text(rowId + '-item-Value');
 
-            // Flag detection
             let flag = null;
             const statusEl = document.getElementById(rowId + '-item-Value-status');
             if (statusEl) {
@@ -698,7 +1076,6 @@ class ResultsManager:
         raw = await page.evaluate(self._JS_PARSE_ROWS)
         results = []
         for t in raw:
-            # Skip commentary rows (e.g. "Creatinine plus auto comment")
             if "comment" in t["test_name"].lower():
                 continue
             flag = t["flag"] if t["flag"] else self._infer_flag(t["value"], t["reference_range"])
@@ -721,7 +1098,6 @@ class ResultsManager:
             v = float(re.sub(r'[^\d.]', '', value))
         except (ValueError, TypeError):
             return None
-        # Double-sided range: "x - y"
         m = re.match(r'^([\d.]+)\s*-\s*([\d.]+)\s*$', ref_range.strip())
         if m:
             lo, hi = float(m.group(1)), float(m.group(2))
@@ -730,7 +1106,6 @@ class ResultsManager:
             if v > hi:
                 return 'H'
             return None
-        # Single-sided range: "<x" or ">x"
         m_ss = re.match(r'^([<>])([\d.]+)\s*$', ref_range.strip())
         if m_ss:
             op, bound = m_ss.group(1), float(m_ss.group(2))
